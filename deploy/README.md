@@ -90,6 +90,60 @@ curl -X POST http://100.90.105.9:8081/register \
 Point providers at `https://herald.supportwing.app/myagent/<endpoint>`, and
 poll from the tailnet at `http://100.90.105.9:8081/endpoints/<endpoint>/messages`.
 
+## Agent access
+
+Two directions, and they are different problems.
+
+**Herald → agent (delivery).** `herald-cli run` polls or streams the queue and
+invokes a handler per message. Config in `~/.config/herald/config.yaml`.
+
+**Agent → Herald (management).** `herald-cli` admin subcommands, and
+`herald-mcp` for MCP clients. Both call `herald_cli::admin`, so they cannot
+drift — the MCP server does not shell out to the CLI.
+
+```bash
+export HERALD_SERVER=http://100.90.105.9:8081     # admin listener, tailnet
+export HERALD_API_KEY=hrl_sk_...
+
+herald-cli register myagent            # needs HERALD_REGISTER_SECRET
+herald-cli depth github                # read-only, does not lease
+herald-cli poll github --limit 10      # LEASES: ack or it redelivers
+herald-cli ack github <msg_id> [...]   # several ids = one batch request
+herald-cli nack github <msg_id> --dlq  # one-way: the DLQ cannot be read back
+herald-cli heartbeat github <msg_id> --extend 600
+herald-cli account [--tier pro]
+```
+
+Every command takes `--json`. Credentials resolve from flag, then environment,
+then config file, so an agent with the two env vars needs no config file.
+
+### MCP
+
+`herald-mcp` speaks stdio and takes its configuration from the environment,
+because an MCP client launches it with no argv:
+
+```json
+{
+  "mcpServers": {
+    "herald": {
+      "command": "/Users/ibakalov/Projects/SimplyQ/herald/target/release/herald-mcp",
+      "env": {
+        "HERALD_SERVER": "http://100.90.105.9:8081",
+        "HERALD_API_KEY": "hrl_sk_...",
+        "HERALD_REGISTER_SECRET": "..."
+      }
+    }
+  }
+}
+```
+
+Tools: `herald_register`, `herald_queue_depth`, `herald_poll_messages`,
+`herald_ack`, `herald_nack`, `herald_heartbeat`, `herald_account`.
+
+`HERALD_SERVER` must be the **admin** listener. The public URL serves ingest
+only, so every management tool 404s against it — which also means an agent
+needs tailnet access to manage Herald at all.
+
 ## Backups
 
 Everything durable is in the Redis accessory volume,
@@ -115,6 +169,15 @@ ssh -i ~/.ssh/simplyqops simplyqops@188.245.204.151 \
   `ssh -L 8081:127.0.0.1:8081 simplyqops@188.245.204.151` is the way back in.
 - `kamal-proxy` takes host ports 80 and 443. Nothing else on this host binds
   them today.
+- **Kamal versions images by git SHA.** Deploying with uncommitted changes
+  rebuilds the same tag, reports success, and changes nothing — the container
+  already runs that tag. Commit first, then deploy, and check
+  `git rev-parse HEAD` against
+  `docker ps --filter label=service=herald --format '{{.Image}}'` when a fix
+  appears not to have landed.
+- **Every workspace member must be COPYed in the Dockerfile.** Cargo resolves
+  the whole workspace even when building one package, so adding a member
+  without adding its `COPY` line fails the image build.
 - Hetzner's **cloud firewall** sits in front of ufw and is not visible from the
   host. ufw showed 80/443 allowed while the cloud firewall silently dropped
   them. To tell the two apart, bind a listener and probe from outside:
