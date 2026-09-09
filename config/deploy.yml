@@ -19,9 +19,12 @@ servers:
     hosts:
       - 188.245.204.151
     options:
-      publish:
-        - "100.90.105.9:8081:8081"
-        - "127.0.0.1:8081:8081"
+      # Reached by the admin gateway through this alias. The app container must
+      # NOT publish a fixed host port: Kamal boots the replacement before
+      # retiring the old container, so any fixed publish collides with itself on
+      # the second deploy ("port is already allocated") and the new container
+      # never starts.
+      network-alias: herald-app
 
 proxy:
   ssl: true
@@ -56,6 +59,21 @@ env:
     - HERALD_REGISTER_SECRET
 
 accessories:
+  # Stable front door for the admin listener. It survives app deploys, so the
+  # tailnet binding lives here instead of on the app container. Plain TCP
+  # forwarding keeps WebSocket streaming (/endpoints/*/stream) working; Herald
+  # only reads client IPs from X-Forwarded-For / X-Real-IP, which nothing sets
+  # on this path either way, so no request metadata is lost by not using HTTP.
+  admin-gw:
+    image: alpine/socat:latest
+    host: 188.245.204.151
+    port: "100.90.105.9:8081:8081"
+    options:
+      # Loopback too, so `ssh -L 8081:127.0.0.1:8081` still gets you in if
+      # tailscaled is down.
+      publish: "127.0.0.1:8081:8081"
+    cmd: TCP-LISTEN:8081,fork,reuseaddr TCP:herald-app:8081
+
   redis:
     image: redis:7-alpine
     host: 188.245.204.151

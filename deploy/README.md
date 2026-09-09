@@ -11,13 +11,19 @@ internet :443 ──▶ kamal-proxy ──▶ herald :8080     ingest only
                   (Let's Encrypt)                  POST /<customer>/<endpoint>
                   herald.supportwing.app           GET  /health
 
-tailnet 100.90.105.9:8081 ─────▶ herald :8081      management
-loopback 127.0.0.1:8081                            /register, /account/*
-                                                   /endpoints/* poll·ack·stream
+tailnet 100.90.105.9:8081 ─┐
+loopback 127.0.0.1:8081 ───┴▶ herald-admin-gw ──▶ herald :8081    management
+                              (socat, stable)     /register, /account/*
+                                                  /endpoints/* poll·ack·stream
 
                                  herald-redis      accounts, API keys,
                                  (kamal network)   encrypted payloads
 ```
+
+The app container publishes **no** host ports and is reached on the `kamal`
+network — by kamal-proxy for ingest, and by `herald-admin-gw` (a socat forwarder
+holding the tailnet binding) for management. See *Gotchas* for why the admin
+port cannot live on the app container.
 
 The split is enforced by the server itself (`HERALD_ADMIN_LISTEN_ADDR`), not by
 a proxy rule: routes absent from a listener return 404 there. A leaked API key
@@ -96,9 +102,33 @@ ssh -i ~/.ssh/simplyqops simplyqops@188.245.204.151 \
 
 ## Gotchas
 
-- The admin port is published to `100.90.105.9`, a `tailscale0` address. If
-  `tailscaled` is not up when Docker restores containers at boot, that publish
-  fails and the container will not start. `127.0.0.1:8081` is published too, so
-  `ssh -L 8081:127.0.0.1:8081` is the fallback path in.
+- **Never give the app role a fixed `publish`.** Kamal boots the replacement
+  container before retiring the old one, so a fixed host port collides with
+  itself on the second deploy — `Bind for 100.90.105.9:8081 failed: port is
+  already allocated`, the new container never starts, and `kamal setup` will
+  have appeared to work because nothing held the port the first time. The
+  tailnet binding lives on the `admin-gw` accessory, which is not recreated per
+  deploy; the app is reached through the `herald-app` network alias.
+- `herald-admin-gw` binds `100.90.105.9`, a `tailscale0` address. If
+  `tailscaled` is down when Docker restores containers at boot, that publish
+  fails and the accessory will not start. It also binds `127.0.0.1:8081`, so
+  `ssh -L 8081:127.0.0.1:8081 simplyqops@188.245.204.151` is the way back in.
 - `kamal-proxy` takes host ports 80 and 443. Nothing else on this host binds
   them today.
+- Hetzner's **cloud firewall** sits in front of ufw and is not visible from the
+  host. ufw showed 80/443 allowed while the cloud firewall silently dropped
+  them. To tell the two apart, bind a listener and probe from outside:
+  `refused` means the packet reached the host, `timeout` means it was dropped
+  upstream. Always probe a known-closed port as a control.
+
+## Known upstream behavior
+
+Ingest is unauthenticated by design, and upstream accepts a webhook for **any**
+`customer_id`, registered or not — `lookup_tier` defaults unknown ids to Free
+and carries on. On a public endpoint that means anyone can create queues and
+persist payloads; internet scanners probing `/api/graphql` did exactly that
+within seconds of this deployment going live. Per-customer rate limits do not
+help, because the caller chooses the `customer_id`.
+
+This fork rejects ingest for unregistered customers (404, nothing written). If
+you rebase onto upstream, keep that check. It has not been reported upstream.
