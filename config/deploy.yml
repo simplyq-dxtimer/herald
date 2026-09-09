@@ -1,0 +1,76 @@
+# Herald — self-hosted on production-kafka01.fsn.supportwing.app (Hetzner, arm64).
+#
+# Two front doors, enforced by the server's split listeners:
+#
+#   internet :443 ──▶ kamal-proxy (Let's Encrypt) ──▶ container :8080
+#                      ingest only: POST /<customer>/<endpoint>, /health
+#
+#   tailnet 100.90.105.9:8081 ─────────────────────▶ container :8081
+#                      /register, /account/*, /endpoints/* (poll/ack/stream)
+#
+# The admin port is published to the Tailscale and loopback addresses only, so
+# queued payloads are unreadable from the public internet even with an API key.
+
+service: herald
+image: simplyqops/herald
+
+servers:
+  web:
+    hosts:
+      - 188.245.204.151
+    options:
+      publish:
+        - "100.90.105.9:8081:8081"
+        - "127.0.0.1:8081:8081"
+
+proxy:
+  ssl: true
+  host: herald.supportwing.app
+  app_port: 8080
+  healthcheck:
+    path: /health
+    interval: 3
+    timeout: 3
+
+ssh:
+  user: simplyqops
+
+registry:
+  server: docker.io
+  username: simplyqops
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+
+builder:
+  arch: arm64
+
+env:
+  clear:
+    HERALD_LISTEN_ADDR: "0.0.0.0:8080"
+    HERALD_ADMIN_LISTEN_ADDR: "0.0.0.0:8081"
+    HERALD_BASE_URL: "https://herald.supportwing.app"
+    RUST_LOG: "info"
+  secret:
+    - HERALD_REDIS_URL
+    - HERALD_ENCRYPTION_KEY
+    - HERALD_REGISTER_SECRET
+
+accessories:
+  redis:
+    image: redis:7-alpine
+    host: 188.245.204.151
+    cmd: >-
+      sh -c 'exec redis-server
+      --requirepass "$REDIS_PASSWORD"
+      --appendonly yes
+      --save 60 1
+      --maxmemory-policy noeviction'
+    env:
+      secret:
+        - REDIS_PASSWORD
+    directories:
+      - data:/data
+
+# Herald keeps accounts, API keys and queued payloads in Redis. Nothing here is
+# recoverable from the image, so the accessory's data directory
+# (/home/simplyqops/herald-redis/data) is the backup target.

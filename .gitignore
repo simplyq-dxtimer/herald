@@ -5,3 +5,7 @@
 *.swp
 *.swo
 .env
+
+# Kamal deploy secrets
+.kamal/secrets.*
+.env.deploy
