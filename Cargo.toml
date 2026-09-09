@@ -1,5 +1,5 @@
 [workspace]
-members = ["herald-server", "herald-cli", "tests"]
+members = ["herald-server", "herald-cli", "herald-mcp", "tests"]
 resolver = "2"
 
 [workspace.package]

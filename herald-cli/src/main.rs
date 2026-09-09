@@ -1,10 +1,8 @@
-mod admin;
-mod client;
-mod config;
-mod error;
 mod handler;
 mod poller;
 mod streamer;
+
+use herald_cli::{admin, client, config, error};
 
 use std::path::PathBuf;
 
@@ -182,45 +180,66 @@ async fn main() {
                 Ok(s) => s,
                 Err(e) => { eprintln!("{e}"); std::process::exit(1); }
             };
-            if let Err(e) = admin::register(server, customer_id, secret, json).await {
-                eprintln!("{e}");
-                std::process::exit(1);
+            match admin::register(server, customer_id.clone(), secret).await {
+                Ok(v) => render(v, json, |v| {
+                    println!("customer_id: {customer_id}");
+                    println!("api_key:     {}", v["api_key"].as_str().unwrap_or(""));
+                    println!();
+                    println!("Store the key now — it is shown in full here and nowhere else.");
+                }),
+                Err(e) => { eprintln!("{e}"); std::process::exit(1); }
             }
         }
 
         Commands::Depth { endpoint, auth, json } => {
-            run_admin(auth, &config_path, json, |t, json| async move {
-                admin::depth(t, endpoint, json).await
+            run_admin(auth, &config_path, json, |t| admin::depth(t, endpoint), |v| {
+                println!("{}: {} queued", v["endpoint"].as_str().unwrap_or(""), v["queue_depth"]);
             }).await;
         }
 
         Commands::Poll { endpoint, limit, visibility_timeout, auth, json } => {
-            run_admin(auth, &config_path, json, |t, json| async move {
-                admin::poll(t, endpoint, limit, visibility_timeout, json).await
+            run_admin(auth, &config_path, json, |t| admin::poll(t, endpoint, limit, visibility_timeout), |v| {
+                let empty = vec![];
+                let data = v["data"].as_array().unwrap_or(&empty);
+                println!("{}: leased {} of {} queued", v["endpoint"].as_str().unwrap_or(""), data.len(), v["queue_depth"]);
+                for m in data {
+                    println!("  {}  deliver_count={}  {}",
+                        m["message_id"].as_str().unwrap_or(""),
+                        m["deliver_count"],
+                        m["body"].as_str().unwrap_or("<binary>"));
+                }
+                if !data.is_empty() {
+                    println!();
+                    println!("Leased for {}s — ACK them or they redeliver.", v["visibility_timeout"]);
+                }
             }).await;
         }
 
         Commands::Ack { endpoint, message_ids, auth, json } => {
-            run_admin(auth, &config_path, json, |t, json| async move {
-                admin::ack(t, endpoint, message_ids, json).await
+            run_admin(auth, &config_path, json, |t| admin::ack(t, endpoint, message_ids), |v| {
+                println!("acked {} message(s)", v["acked"].as_array().map(|a| a.len()).unwrap_or(0));
             }).await;
         }
 
         Commands::Nack { endpoint, message_id, dlq, auth, json } => {
-            run_admin(auth, &config_path, json, |t, json| async move {
-                admin::nack(t, endpoint, message_id, dlq, json).await
+            run_admin(auth, &config_path, json, |t| admin::nack(t, endpoint, message_id, dlq), |v| {
+                println!("{} -> {}", v["message_id"].as_str().unwrap_or(""), v["disposition"].as_str().unwrap_or(""));
+                if let Some(w) = v["warning"].as_str() {
+                    println!();
+                    println!("Note: {w}");
+                }
             }).await;
         }
 
         Commands::Heartbeat { endpoint, message_id, extend, auth, json } => {
-            run_admin(auth, &config_path, json, |t, json| async move {
-                admin::heartbeat(t, endpoint, message_id, extend, json).await
+            run_admin(auth, &config_path, json, |t| admin::heartbeat(t, endpoint, message_id, extend), |v| {
+                println!("{} visibility extended", v["message_id"].as_str().unwrap_or(""));
             }).await;
         }
 
         Commands::Account { tier, auth, json } => {
-            run_admin(auth, &config_path, json, |t, json| async move {
-                admin::account(t, tier, json).await
+            run_admin(auth, &config_path, json, |t| admin::account(t, tier), |v| {
+                println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
             }).await;
         }
 
@@ -265,15 +284,27 @@ async fn main() {
     }
 }
 
-/// Resolve the target, run an admin command, and exit non-zero on failure.
+/// Print a result as JSON, or hand it to a human renderer.
+fn render(value: serde_json::Value, json: bool, human: impl FnOnce(&serde_json::Value)) {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+    } else {
+        human(&value);
+    }
+}
+
+/// Resolve the target, run an admin command, render it, and exit non-zero on
+/// failure. The operation itself lives in `herald_cli::admin` so `herald-mcp`
+/// runs the identical code path.
 async fn run_admin<F, Fut>(
     auth: AuthArgs,
     config_path: &PathBuf,
     json: bool,
     f: F,
+    human: impl FnOnce(&serde_json::Value),
 ) where
-    F: FnOnce(admin::Target, bool) -> Fut,
-    Fut: std::future::Future<Output = Result<(), error::CliError>>,
+    F: FnOnce(admin::Target) -> Fut,
+    Fut: std::future::Future<Output = Result<serde_json::Value, error::CliError>>,
 {
     let target = match admin::resolve(auth.server, auth.api_key, config_path) {
         Ok(t) => t,
@@ -282,8 +313,11 @@ async fn run_admin<F, Fut>(
             std::process::exit(1);
         }
     };
-    if let Err(e) = f(target, json).await {
-        eprintln!("{e}");
-        std::process::exit(1);
+    match f(target).await {
+        Ok(v) => render(v, json, human),
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
     }
 }

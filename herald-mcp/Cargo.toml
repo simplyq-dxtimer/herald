@@ -1,0 +1,15 @@
+[package]
+name = "herald-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MCP server exposing Herald's management API as agent tools"
+
+[dependencies]
+herald-cli = { path = "../herald-cli" }
+rmcp = { version = "3", features = ["server", "transport-io", "macros"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

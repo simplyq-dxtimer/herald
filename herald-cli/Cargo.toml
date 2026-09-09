@@ -5,6 +5,14 @@ edition.workspace = true
 license.workspace = true
 description = "Local daemon for Herald — polls queue, invokes handlers, reports ACK/NACK"
 
+[lib]
+name = "herald_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "herald-cli"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }

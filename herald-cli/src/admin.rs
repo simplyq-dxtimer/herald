@@ -67,43 +67,20 @@ pub fn resolve_server(
         })
 }
 
-fn emit(json_out: bool, value: Value, human: impl FnOnce()) {
-    if json_out {
-        println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
-    } else {
-        human();
-    }
-}
-
 pub async fn register(
     server: String,
     customer_id: String,
     secret: Option<String>,
-    json_out: bool,
-) -> Result<(), CliError> {
+) -> Result<Value, CliError> {
     let secret = secret
         .or_else(|| std::env::var("HERALD_REGISTER_SECRET").ok().filter(|s| !s.is_empty()));
-
-    let resp = HeraldClient::register(&server, &customer_id, secret.as_deref()).await?;
-    let key = resp.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
-
-    emit(json_out, resp.clone(), || {
-        println!("customer_id: {customer_id}");
-        println!("api_key:     {key}");
-        println!();
-        println!("Store the key now — it is shown in full here and nowhere else.");
-    });
-    Ok(())
+    HeraldClient::register(&server, &customer_id, secret.as_deref()).await
 }
 
-pub async fn depth(t: Target, endpoint: String, json_out: bool) -> Result<(), CliError> {
+pub async fn depth(t: Target, endpoint: String) -> Result<Value, CliError> {
     let client = HeraldClient::new(&t.server, &t.api_key);
     let depth = client.depth(&endpoint).await?;
-
-    emit(json_out, json!({ "endpoint": endpoint, "queue_depth": depth }), || {
-        println!("{endpoint}: {depth} queued");
-    });
-    Ok(())
+    Ok(json!({ "endpoint": endpoint, "queue_depth": depth }))
 }
 
 /// Lease messages. This is a *read that writes*: each message returned is moved
@@ -115,8 +92,7 @@ pub async fn poll(
     endpoint: String,
     limit: usize,
     visibility_timeout: u64,
-    json_out: bool,
-) -> Result<(), CliError> {
+) -> Result<Value, CliError> {
     use base64::Engine as _;
 
     let client = HeraldClient::new(&t.server, &t.api_key);
@@ -144,39 +120,21 @@ pub async fn poll(
         })
         .collect();
 
-    let out = json!({
+    Ok(json!({
         "endpoint": endpoint,
         "queue_depth": resp.queue_depth,
         "has_more": resp.has_more,
         "leased": decoded.len(),
         "visibility_timeout": visibility_timeout,
         "data": decoded,
-    });
-
-    emit(json_out, out, || {
-        println!("{endpoint}: leased {} of {} queued", decoded.len(), resp.queue_depth);
-        for m in &decoded {
-            println!(
-                "  {}  deliver_count={}  {}",
-                m["message_id"].as_str().unwrap_or(""),
-                m["deliver_count"],
-                m["body"].as_str().unwrap_or("<binary>")
-            );
-        }
-        if !decoded.is_empty() {
-            println!();
-            println!("Leased for {visibility_timeout}s — ACK them or they redeliver.");
-        }
-    });
-    Ok(())
+    }))
 }
 
 pub async fn ack(
     t: Target,
     endpoint: String,
     message_ids: Vec<String>,
-    json_out: bool,
-) -> Result<(), CliError> {
+) -> Result<Value, CliError> {
     let client = HeraldClient::new(&t.server, &t.api_key);
 
     if message_ids.len() == 1 {
@@ -184,11 +142,7 @@ pub async fn ack(
     } else {
         client.batch_ack(&endpoint, &message_ids).await?;
     }
-
-    emit(json_out, json!({ "acked": message_ids }), || {
-        println!("acked {} message(s)", message_ids.len());
-    });
-    Ok(())
+    Ok(json!({ "acked": message_ids }))
 }
 
 pub async fn nack(
@@ -196,21 +150,20 @@ pub async fn nack(
     endpoint: String,
     message_id: String,
     dlq: bool,
-    json_out: bool,
-) -> Result<(), CliError> {
+) -> Result<Value, CliError> {
     let client = HeraldClient::new(&t.server, &t.api_key);
     client.nack(&endpoint, &message_id, dlq).await?;
 
-    let disposition = if dlq { "dlq" } else { "requeue" };
-    emit(json_out, json!({ "message_id": message_id, "disposition": disposition }), || {
-        println!("{message_id} -> {disposition}");
-        if dlq {
-            println!();
-            println!("Note: this server exposes no route to read or drain the DLQ.");
-            println!("Messages sent there are not retrievable over the API.");
-        }
+    let mut out = json!({
+        "message_id": message_id,
+        "disposition": if dlq { "dlq" } else { "requeue" },
     });
-    Ok(())
+    if dlq {
+        // Say so at the call site: the server has no route to read the DLQ
+        // back, so this is a one-way door.
+        out["warning"] = json!("this server exposes no route to read or drain the DLQ; the message is not retrievable over the API");
+    }
+    Ok(out)
 }
 
 pub async fn heartbeat(
@@ -218,26 +171,16 @@ pub async fn heartbeat(
     endpoint: String,
     message_id: String,
     extend: Option<u64>,
-    json_out: bool,
-) -> Result<(), CliError> {
+) -> Result<Value, CliError> {
     let client = HeraldClient::new(&t.server, &t.api_key);
     client.heartbeat(&endpoint, &message_id, extend).await?;
-
-    emit(json_out, json!({ "message_id": message_id, "extended_by": extend }), || {
-        println!("{message_id} visibility extended");
-    });
-    Ok(())
+    Ok(json!({ "message_id": message_id, "extended_by": extend }))
 }
 
-pub async fn account(t: Target, tier: Option<String>, json_out: bool) -> Result<(), CliError> {
+pub async fn account(t: Target, tier: Option<String>) -> Result<Value, CliError> {
     let client = HeraldClient::new(&t.server, &t.api_key);
-    let resp = match tier {
-        Some(tier) => client.set_tier(&tier).await?,
-        None => client.billing().await?,
-    };
-
-    emit(json_out, resp.clone(), || {
-        println!("{}", serde_json::to_string_pretty(&resp).unwrap_or_default());
-    });
-    Ok(())
+    match tier {
+        Some(tier) => client.set_tier(&tier).await,
+        None => client.billing().await,
+    }
 }
