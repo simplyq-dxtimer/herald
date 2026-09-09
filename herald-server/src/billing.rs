@@ -120,15 +120,35 @@ pub async fn get_billing(
     let mut conn = state.redis.clone();
     let account = auth::lookup_account(&mut conn, &key).await?;
 
-    let stripe_key = state.config.stripe_api_key.as_ref().ok_or_else(|| {
-        HeraldError::Internal("billing not configured".into())
-    })?;
-
     let current_tier = match account.tier {
         Tier::Free => "free",
         Tier::Standard => "standard",
         Tier::Pro => "pro",
         Tier::Enterprise => "enterprise",
+    };
+
+    // A self-hosted deployment has no Stripe key, which is a configuration
+    // state and not a failure. Report the account and its limits, with no
+    // upgrade options to offer, instead of a 500 that makes /account/billing
+    // unusable for every self-hoster.
+    let Some(stripe_key) = state.config.stripe_api_key.as_ref() else {
+        let limits = account.tier.limits();
+        return Ok(Json(json!({
+            "customer_id": account.customer_id,
+            "tier": current_tier,
+            "billing": "not_configured",
+            "upgrade_options": [],
+            "limits": {
+                "max_endpoints": limits.max_endpoints,
+                "max_messages_per_day": limits.max_messages_per_day,
+                "burst_per_minute": limits.burst_per_minute,
+                "max_queue_depth": limits.max_queue_depth,
+                "max_payload_bytes": limits.max_payload_bytes,
+                "retention_seconds": limits.retention.as_secs(),
+                "websocket_allowed": limits.websocket_allowed,
+                "headers_included": limits.headers_included,
+            },
+        })));
     };
 
     // Build upgrade options (only tiers above current)
