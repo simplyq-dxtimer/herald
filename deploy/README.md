@@ -109,10 +109,17 @@ herald-cli register myagent            # needs HERALD_REGISTER_SECRET
 herald-cli depth github                # read-only, does not lease
 herald-cli poll github --limit 10      # LEASES: ack or it redelivers
 herald-cli ack github <msg_id> [...]   # several ids = one batch request
-herald-cli nack github <msg_id> --dlq  # one-way: the DLQ cannot be read back
+herald-cli nack github <msg_id> --dlq  # give up on it; recoverable via dlq-replay
 herald-cli heartbeat github <msg_id> --extend 600
 herald-cli account [--tier pro]
+
+herald-cli dlq github                  # read-only: why messages died
+herald-cli dlq-replay github [<msg_id>]   # omit id to replay all
+herald-cli dlq-purge github <msg_id>      # or --yes to purge all (irreversible)
 ```
+
+`depth` and `poll` both report `dlq_depth`, so silent failure accumulation is
+visible without a separate check.
 
 Every command takes `--json`. Credentials resolve from flag, then environment,
 then config file, so an agent with the two env vars needs no config file.
@@ -138,7 +145,8 @@ because an MCP client launches it with no argv:
 ```
 
 Tools: `herald_register`, `herald_queue_depth`, `herald_poll_messages`,
-`herald_ack`, `herald_nack`, `herald_heartbeat`, `herald_account`.
+`herald_ack`, `herald_nack`, `herald_heartbeat`, `herald_account`,
+`herald_dlq_list`, `herald_dlq_replay`, `herald_dlq_purge`.
 
 `HERALD_SERVER` must be the **admin** listener. The public URL serves ingest
 only, so every management tool 404s against it — which also means an agent
@@ -184,6 +192,28 @@ ssh -i ~/.ssh/simplyqops simplyqops@188.245.204.151 \
   `refused` means the packet reached the host, `timeout` means it was dropped
   upstream. Always probe a known-closed port as a control.
 
+## Dead letter queue
+
+Messages reach the DLQ by `nack --dlq` or by exhausting retries. Upstream had
+no route to read them back; this fork adds list, replay and purge.
+
+Three behaviors worth knowing:
+
+- **Listing never mutates.** Reading the DLQ does not lease, requeue, or touch
+  delivery counts, so diagnosing is safe to repeat.
+- **Replay resets `deliver_count`.** A dead message is at or past
+  `max_retries`; without the reset it would return to the DLQ on its first
+  failure. Replayed messages go to the back of the queue, behind live traffic.
+  Fix the cause before replaying or they simply fail again.
+- **Entries can outlive their payload.** `meta:{id}` carries the tier retention
+  TTL (7 days on free) but the dead list itself never expires, so an id can
+  remain after its body is gone. Those list as `expired: true` and can only be
+  purged, not replayed.
+
+The DLQ is **unbounded** — nothing caps its length, and it is not covered by
+`max_queue_depth`. Watch `dlq_depth`; a wedged consumer will grow it until the
+Redis 2gb ceiling stops accepting writes.
+
 ## Known upstream behavior
 
 Ingest is unauthenticated by design, and upstream accepts a webhook for **any**
@@ -194,4 +224,6 @@ within seconds of this deployment going live. Per-customer rate limits do not
 help, because the caller chooses the `customer_id`.
 
 This fork rejects ingest for unregistered customers (404, nothing written). If
-you rebase onto upstream, keep that check. It has not been reported upstream.
+you rebase onto upstream, keep that check, along with the `/account/billing`
+fix (upstream 500s when Stripe is unconfigured, i.e. on every self-hosted
+deployment) and the DLQ routes. None of it has been reported upstream.

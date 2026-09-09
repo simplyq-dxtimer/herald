@@ -79,8 +79,12 @@ pub async fn register(
 
 pub async fn depth(t: Target, endpoint: String) -> Result<Value, CliError> {
     let client = HeraldClient::new(&t.server, &t.api_key);
-    let depth = client.depth(&endpoint).await?;
-    Ok(json!({ "endpoint": endpoint, "queue_depth": depth }))
+    let resp = client.poll_full(&endpoint, 0, 30).await?;
+    Ok(json!({
+        "endpoint": endpoint,
+        "queue_depth": resp.queue_depth,
+        "dlq_depth": resp.dlq_depth,
+    }))
 }
 
 /// Lease messages. This is a *read that writes*: each message returned is moved
@@ -123,6 +127,7 @@ pub async fn poll(
     Ok(json!({
         "endpoint": endpoint,
         "queue_depth": resp.queue_depth,
+        "dlq_depth": resp.dlq_depth,
         "has_more": resp.has_more,
         "leased": decoded.len(),
         "visibility_timeout": visibility_timeout,

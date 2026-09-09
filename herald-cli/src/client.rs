@@ -17,6 +17,10 @@ pub struct PollResponse {
     pub has_more: bool,
     #[serde(default)]
     pub queue_depth: u64,
+    /// Messages that died on this endpoint. Surfaced on every poll so a
+    /// consumer notices failures instead of only ever seeing an empty queue.
+    #[serde(default)]
+    pub dlq_depth: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

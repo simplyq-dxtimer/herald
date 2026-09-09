@@ -231,7 +231,8 @@ async fn main() {
 
         Commands::Depth { endpoint, auth, json } => {
             run_admin(auth, &config_path, json, |t| admin::depth(t, endpoint), |v| {
-                println!("{}: {} queued", v["endpoint"].as_str().unwrap_or(""), v["queue_depth"]);
+                println!("{}: {} queued, {} dead",
+                    v["endpoint"].as_str().unwrap_or(""), v["queue_depth"], v["dlq_depth"]);
             }).await;
         }
 
@@ -239,7 +240,8 @@ async fn main() {
             run_admin(auth, &config_path, json, |t| admin::poll(t, endpoint, limit, visibility_timeout), |v| {
                 let empty = vec![];
                 let data = v["data"].as_array().unwrap_or(&empty);
-                println!("{}: leased {} of {} queued", v["endpoint"].as_str().unwrap_or(""), data.len(), v["queue_depth"]);
+                println!("{}: leased {} of {} queued ({} dead)",
+                    v["endpoint"].as_str().unwrap_or(""), data.len(), v["queue_depth"], v["dlq_depth"]);
                 for m in data {
                     println!("  {}  deliver_count={}  {}",
                         m["message_id"].as_str().unwrap_or(""),
