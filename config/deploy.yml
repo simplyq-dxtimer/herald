@@ -64,6 +64,7 @@ accessories:
       --requirepass "$REDIS_PASSWORD"
       --appendonly yes
       --save 60 1
+      --maxmemory 2gb
       --maxmemory-policy noeviction'
     env:
       secret:
@@ -74,3 +75,8 @@ accessories:
 # Herald keeps accounts, API keys and queued payloads in Redis. Nothing here is
 # recoverable from the image, so the accessory's data directory
 # (/home/simplyqops/herald-redis/data) is the backup target.
+#
+# maxmemory is a hard ceiling, not a tuning knob: this host has 7.5G shared with
+# burty-chromadb, and noeviction means a flood makes Redis refuse writes rather
+# than silently drop delivered-but-unacked webhooks. Without the ceiling the
+# only limit is the host OOM killer, which would take ChromaDB with it.

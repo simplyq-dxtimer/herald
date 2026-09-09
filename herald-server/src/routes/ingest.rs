@@ -31,6 +31,19 @@ pub async fn ingest_webhook(
     let mut conn = state.redis.clone();
     let endpoint = format!("{customer_id}/{endpoint_name}");
 
+    // Reject unknown customers before touching any other key. Ingest is
+    // unauthenticated by design, so without this an arbitrary POST to
+    // /<anything>/<anything> would create a queue and persist a payload for an
+    // account that was never registered. The per-customer rate limit does not
+    // contain that: the caller picks customer_id, so every invented name gets
+    // its own budget. Checked first so a probe costs one EXISTS and writes
+    // nothing.
+    if !account_exists(&mut conn, &customer_id).await? {
+        return Err(HeraldError::NotFound(format!(
+            "no endpoint at /{customer_id}/{endpoint_name}"
+        )));
+    }
+
     // Check per-customer ingest auth (if configured)
     if let Some(ingest_auth) = auth::load_ingest_auth(
         &mut conn,
@@ -150,6 +163,20 @@ fn serialize_headers(headers: &HeaderMap) -> String {
 }
 
 /// Look up the tier for a customer. Falls back to Free if unknown.
+/// Whether `customer_id` has been registered. `register` writes
+/// `customer_apikey:<id>` for every account, so its presence is the
+/// authoritative existence check.
+async fn account_exists(
+    conn: &mut redis::aio::MultiplexedConnection,
+    customer_id: &str,
+) -> Result<bool, HeraldError> {
+    let exists: bool = redis::cmd("EXISTS")
+        .arg(format!("customer_apikey:{customer_id}"))
+        .query_async(conn)
+        .await?;
+    Ok(exists)
+}
+
 async fn lookup_tier(conn: &mut redis::aio::MultiplexedConnection, customer_id: &str) -> Tier {
     let tier_str: Option<String> = redis::cmd("GET")
         .arg(format!("tier:{customer_id}"))
