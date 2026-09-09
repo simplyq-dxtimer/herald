@@ -9,7 +9,7 @@ mod state;
 
 use std::time::Duration;
 
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
@@ -143,6 +143,25 @@ fn management_routes() -> Router<AppState> {
         .route(
             "/endpoints/{endpoint_name}/messages/{message_id}/heartbeat",
             post(routes::agent::heartbeat),
+        )
+        // Dead letter queue. `dlq/replay` is a static segment and therefore
+        // matches ahead of `dlq/{message_id}`; message ids are `msg_<64hex>`
+        // so nothing can collide with it.
+        .route(
+            "/endpoints/{endpoint_name}/dlq",
+            get(routes::agent::list_dlq).delete(routes::agent::purge_dlq),
+        )
+        .route(
+            "/endpoints/{endpoint_name}/dlq/replay",
+            post(routes::agent::replay_dlq),
+        )
+        .route(
+            "/endpoints/{endpoint_name}/dlq/{message_id}/replay",
+            post(routes::agent::replay_dlq_message),
+        )
+        .route(
+            "/endpoints/{endpoint_name}/dlq/{message_id}",
+            delete(routes::agent::purge_dlq_message),
         )
         // WebSocket streaming
         .route(

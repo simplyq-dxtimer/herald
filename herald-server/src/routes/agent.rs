@@ -71,6 +71,9 @@ pub async fn poll_messages(
     // has_more is a heuristic: true iff we filled the requested page.
     let has_more = messages.len() == limit && limit > 0;
     let queue_depth = queue::depth(&mut conn, &account.customer_id, &endpoint_name).await?;
+    // Surfaced on every poll: without it, messages dying into the DLQ are
+    // invisible to a consumer that only ever polls.
+    let dlq_depth = queue::dlq_depth(&mut conn, &account.customer_id, &endpoint_name).await?;
 
     let mut responses = Vec::with_capacity(messages.len());
     for msg in messages {
@@ -117,6 +120,7 @@ pub async fn poll_messages(
         "data": responses,
         "has_more": has_more,
         "queue_depth": queue_depth,
+        "dlq_depth": dlq_depth,
     }))
     .into_response())
 }
@@ -321,4 +325,184 @@ mod tests {
     fn test_nack_disposition_rejects_unknown() {
         assert!(serde_json::from_str::<NackBody>(r#"{"disposition":"foo"}"#).is_err());
     }
+}
+
+// =============================================================================
+// Dead letter queue
+//
+// Messages reach the DLQ by nack(disposition=dlq) or by exhausting max_retries.
+// Without these routes they were unreachable: the payload stayed in Redis until
+// its retention TTL expired, with no way to see why it died or to retry it.
+// =============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct DlqListParams {
+    #[serde(default)]
+    pub offset: isize,
+    #[serde(default = "default_dlq_limit")]
+    pub limit: isize,
+}
+
+fn default_dlq_limit() -> isize {
+    50
+}
+
+/// GET /endpoints/{endpoint_name}/dlq
+///
+/// Read-only. Listing the DLQ never replays, purges, or alters delivery counts.
+pub async fn list_dlq(
+    State(state): State<AppState>,
+    Path(endpoint_name): Path<String>,
+    Query(params): Query<DlqListParams>,
+    req: axum::extract::Request,
+) -> Result<impl IntoResponse, HeraldError> {
+    let api_key = auth::extract_api_key(&req)?;
+    let mut conn = state.redis.clone();
+    let account = auth::lookup_account(&mut conn, &api_key).await?;
+    let limits = account.tier.limits();
+
+    let limit = params.limit.min(100);
+    let entries =
+        queue::dlq_list(&mut conn, &account.customer_id, &endpoint_name, params.offset, limit)
+            .await?;
+    let dlq_depth = queue::dlq_depth(&mut conn, &account.customer_id, &endpoint_name).await?;
+
+    let mut data = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match entry {
+            queue::DlqEntry::Expired(message_id) => {
+                data.push(json!({
+                    "object": "dlq_entry",
+                    "message_id": crypto::wire_message_id(&message_id),
+                    "expired": true,
+                }));
+            }
+            queue::DlqEntry::Message(msg) => {
+                let plaintext = if msg.encryption == "none" {
+                    msg.body.clone()
+                } else {
+                    crypto::decrypt(&state.config.service_encryption_key, &msg.body)?
+                };
+                let headers = if limits.headers_included {
+                    msg.headers
+                        .as_ref()
+                        .and_then(|h| base64::engine::general_purpose::STANDARD.decode(h).ok())
+                        .and_then(|e| crypto::decrypt(&state.config.service_encryption_key, &e).ok())
+                        .and_then(|d| String::from_utf8(d).ok())
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                } else {
+                    None
+                };
+
+                data.push(json!({
+                    "object": "dlq_entry",
+                    "message_id": crypto::wire_message_id(&msg.message_id),
+                    "fingerprint": crypto::wire_fingerprint(&msg.fingerprint),
+                    "body": base64::engine::general_purpose::STANDARD.encode(&plaintext),
+                    "headers": headers,
+                    "received_at": queue::nanos_to_seconds(msg.received_at),
+                    "deliver_count": msg.deliver_count,
+                    "encryption": msg.encryption,
+                    "expired": false,
+                }));
+            }
+        }
+    }
+
+    Ok(Json(json!({
+        "object": "list",
+        "data": data,
+        "dlq_depth": dlq_depth,
+        "has_more": params.offset + (data.len() as isize) < dlq_depth as isize,
+    })))
+}
+
+/// POST /endpoints/{endpoint_name}/dlq/{message_id}/replay
+pub async fn replay_dlq_message(
+    State(state): State<AppState>,
+    Path((endpoint_name, message_id)): Path<(String, String)>,
+    req: axum::extract::Request,
+) -> Result<impl IntoResponse, HeraldError> {
+    let api_key = auth::extract_api_key(&req)?;
+    let mut conn = state.redis.clone();
+    let account = auth::lookup_account(&mut conn, &api_key).await?;
+    let id = crypto::parse_wire_message_id(&message_id)?;
+
+    let replayed =
+        queue::dlq_replay(&mut conn, &account.customer_id, &endpoint_name, &id).await?;
+    if !replayed {
+        return Err(HeraldError::NotFound(format!(
+            "no message {message_id} in the DLQ for {endpoint_name}"
+        )));
+    }
+
+    Ok(Json(json!({
+        "object": "dlq_replay",
+        "message_id": message_id,
+        "replayed": 1,
+    })))
+}
+
+/// POST /endpoints/{endpoint_name}/dlq/replay — replay everything.
+pub async fn replay_dlq(
+    State(state): State<AppState>,
+    Path(endpoint_name): Path<String>,
+    req: axum::extract::Request,
+) -> Result<impl IntoResponse, HeraldError> {
+    let api_key = auth::extract_api_key(&req)?;
+    let mut conn = state.redis.clone();
+    let account = auth::lookup_account(&mut conn, &api_key).await?;
+
+    let replayed =
+        queue::dlq_replay_all(&mut conn, &account.customer_id, &endpoint_name).await?;
+
+    Ok(Json(json!({
+        "object": "dlq_replay",
+        "endpoint": endpoint_name,
+        "replayed": replayed,
+    })))
+}
+
+/// DELETE /endpoints/{endpoint_name}/dlq/{message_id}
+pub async fn purge_dlq_message(
+    State(state): State<AppState>,
+    Path((endpoint_name, message_id)): Path<(String, String)>,
+    req: axum::extract::Request,
+) -> Result<impl IntoResponse, HeraldError> {
+    let api_key = auth::extract_api_key(&req)?;
+    let mut conn = state.redis.clone();
+    let account = auth::lookup_account(&mut conn, &api_key).await?;
+    let id = crypto::parse_wire_message_id(&message_id)?;
+
+    let purged = queue::dlq_purge(&mut conn, &account.customer_id, &endpoint_name, &id).await?;
+    if !purged {
+        return Err(HeraldError::NotFound(format!(
+            "no message {message_id} in the DLQ for {endpoint_name}"
+        )));
+    }
+
+    Ok(Json(json!({
+        "object": "dlq_purge",
+        "message_id": message_id,
+        "purged": 1,
+    })))
+}
+
+/// DELETE /endpoints/{endpoint_name}/dlq — purge everything. Irreversible.
+pub async fn purge_dlq(
+    State(state): State<AppState>,
+    Path(endpoint_name): Path<String>,
+    req: axum::extract::Request,
+) -> Result<impl IntoResponse, HeraldError> {
+    let api_key = auth::extract_api_key(&req)?;
+    let mut conn = state.redis.clone();
+    let account = auth::lookup_account(&mut conn, &api_key).await?;
+
+    let purged = queue::dlq_purge_all(&mut conn, &account.customer_id, &endpoint_name).await?;
+
+    Ok(Json(json!({
+        "object": "dlq_purge",
+        "endpoint": endpoint_name,
+        "purged": purged,
+    })))
 }

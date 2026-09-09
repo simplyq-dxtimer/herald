@@ -86,7 +86,9 @@ impl ServerHandler for Herald {
              <public-url>/<customer_id>/<endpoint>; messages are read back \
              through these tools. Use herald_queue_depth to look at a queue and \
              herald_poll_messages only when you intend to process: polling \
-             leases messages and they redeliver unless acked."
+             leases messages and they redeliver unless acked. Messages that \
+             keep failing land in the dead letter queue — herald_dlq_list \
+             shows them, herald_dlq_replay retries them."
                 .to_string(),
         );
         info
@@ -157,6 +159,40 @@ impl ServerHandler for Herald {
                     ),
                 ),
                 tool(
+                    "herald_dlq_list",
+                    "Read the dead letter queue: messages that exhausted their retries or were explicitly nacked to the DLQ. Read-only — listing never replays, purges, or changes delivery counts, so it is safe to call while diagnosing. Entries marked expired:true are ids whose payload aged out of retention; they can only be purged, not replayed.",
+                    schema(
+                        &[
+                            ("endpoint", "string", "Endpoint name"),
+                            ("offset", "integer", "Start offset from the most recently dead message (default 0)"),
+                            ("limit", "integer", "Max entries (default 50, capped at 100)"),
+                        ],
+                        &["endpoint"],
+                    ),
+                ),
+                tool(
+                    "herald_dlq_replay",
+                    "Move dead messages back onto the main queue for another attempt. Pass message_id to replay one, or omit it to replay the whole DLQ. deliver_count is reset, so a replayed message gets a full set of retries rather than dying again on first failure. Replayed messages go to the back of the queue and do not jump ahead of live webhooks. Fix the cause before replaying, or they will simply fail again.",
+                    schema(
+                        &[
+                            ("endpoint", "string", "Endpoint name"),
+                            ("message_id", "string", "Message to replay; omit to replay every dead message"),
+                        ],
+                        &["endpoint"],
+                    ),
+                ),
+                tool(
+                    "herald_dlq_purge",
+                    "Permanently delete dead messages and their payloads. Pass message_id to purge one, or omit it to purge the entire DLQ. THIS CANNOT BE UNDONE and the payload is not recoverable afterwards — list the DLQ first and confirm with the user before purging everything. Purging does not clear the dedup fingerprint, so an identical payload re-sent later is still deduplicated.",
+                    schema(
+                        &[
+                            ("endpoint", "string", "Endpoint name"),
+                            ("message_id", "string", "Message to purge; omit to purge every dead message"),
+                        ],
+                        &["endpoint"],
+                    ),
+                ),
+                tool(
                     "herald_account",
                     "Read account and billing state, or change the tier by passing one of free, standard, pro, enterprise. Tier governs endpoint count, daily message allowance, payload size, retention and whether WebSocket streaming is permitted.",
                     schema(&[("tier", "string", "Optional new tier; omit to read current state")], &[]),
@@ -220,6 +256,31 @@ impl ServerHandler for Herald {
                     arg_str(&args, "endpoint")?,
                     arg_str(&args, "message_id")?,
                     arg_u64(&args, "extend"),
+                )
+                .await
+            }
+            "herald_dlq_list" => {
+                admin::dlq_list(
+                    target()?,
+                    arg_str(&args, "endpoint")?,
+                    args.get("offset").and_then(|v| v.as_i64()).unwrap_or(0),
+                    args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50),
+                )
+                .await
+            }
+            "herald_dlq_replay" => {
+                admin::dlq_replay(
+                    target()?,
+                    arg_str(&args, "endpoint")?,
+                    args.get("message_id").and_then(|v| v.as_str()).map(String::from),
+                )
+                .await
+            }
+            "herald_dlq_purge" => {
+                admin::dlq_purge(
+                    target()?,
+                    arg_str(&args, "endpoint")?,
+                    args.get("message_id").and_then(|v| v.as_str()).map(String::from),
                 )
                 .await
             }

@@ -340,6 +340,218 @@ async fn move_to_dlq(
     Ok(())
 }
 
+/// Wake any WebSocket streamer waiting on this endpoint. Mirrors the PUBLISH
+/// that `enqueue` performs; a replayed message is new work to a listener.
+async fn notify(
+    conn: &mut redis::aio::MultiplexedConnection,
+    customer_id: &str,
+    endpoint: &str,
+    message_id: &str,
+) {
+    let _: Result<(), _> = redis::cmd("PUBLISH")
+        .arg(notify_channel(customer_id, endpoint))
+        .arg(message_id)
+        .query_async::<()>(conn)
+        .await;
+}
+
+/// One DLQ entry. The payload may be gone: `meta:{id}` carries the tier's
+/// retention TTL while the dead list itself does not expire, so an id can
+/// outlive its metadata.
+pub enum DlqEntry {
+    Message(Box<Message>),
+    /// The id is still listed but its metadata has expired.
+    Expired(String),
+}
+
+/// Depth of the dead letter queue.
+pub async fn dlq_depth(
+    conn: &mut redis::aio::MultiplexedConnection,
+    customer_id: &str,
+    endpoint: &str,
+) -> Result<u64, HeraldError> {
+    let depth: u64 = conn.llen(dead_key(customer_id, endpoint)).await?;
+    Ok(depth)
+}
+
+/// Read a window of the DLQ without changing it.
+///
+/// Unlike `fetch`, this does not pop, lease, or touch deliver_count: inspecting
+/// why messages died must not itself be a mutation. `offset` is from the head,
+/// which is the most recently dead message (`move_to_dlq` uses LPUSH).
+pub async fn dlq_list(
+    conn: &mut redis::aio::MultiplexedConnection,
+    customer_id: &str,
+    endpoint: &str,
+    offset: isize,
+    limit: isize,
+) -> Result<Vec<DlqEntry>, HeraldError> {
+    let dk = dead_key(customer_id, endpoint);
+    let stop = if limit <= 0 { -1 } else { offset + limit - 1 };
+    let ids: Vec<String> = conn.lrange(&dk, offset, stop).await?;
+
+    let mut entries = Vec::with_capacity(ids.len());
+    for msg_id in ids {
+        match load_message(conn, &msg_id, endpoint).await? {
+            Some(msg) => entries.push(DlqEntry::Message(Box::new(msg))),
+            // Report these rather than dropping them, so the listing reconciles
+            // with dlq_depth instead of mysteriously returning fewer rows.
+            // Removing them here would make a read into a write.
+            None => entries.push(DlqEntry::Expired(msg_id)),
+        }
+    }
+    Ok(entries)
+}
+
+/// Load one message from its metadata hash. Read-only.
+async fn load_message(
+    conn: &mut redis::aio::MultiplexedConnection,
+    message_id: &str,
+    endpoint: &str,
+) -> Result<Option<Message>, HeraldError> {
+    let fields: HashMap<String, String> = conn.hgetall(meta_key(message_id)).await?;
+    if fields.is_empty() {
+        return Ok(None);
+    }
+
+    let body = base64::engine::general_purpose::STANDARD
+        .decode(fields.get("body").cloned().unwrap_or_default())
+        .unwrap_or_default();
+
+    Ok(Some(Message {
+        message_id: message_id.to_string(),
+        fingerprint: fields.get("fingerprint").cloned().unwrap_or_default(),
+        endpoint: endpoint.to_string(),
+        headers: fields.get("headers").cloned().filter(|h| !h.is_empty()),
+        body,
+        encryption: fields.get("encryption").cloned().unwrap_or_default(),
+        key_version: fields.get("key_version").cloned().filter(|v| !v.is_empty()),
+        received_at: fields
+            .get("received_at")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+        deliver_count: fields
+            .get("deliver_count")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+    }))
+}
+
+/// Move one message from the DLQ back onto the main queue.
+///
+/// deliver_count is reset to 0. Without that the message is already at or past
+/// max_retries, so the first nack — or a single visibility expiry — would send
+/// it straight back to the DLQ and replay would be a no-op.
+pub async fn dlq_replay(
+    conn: &mut redis::aio::MultiplexedConnection,
+    customer_id: &str,
+    endpoint: &str,
+    message_id: &str,
+) -> Result<bool, HeraldError> {
+    let dk = dead_key(customer_id, endpoint);
+
+    let removed: u32 = conn.lrem(&dk, 1, message_id).await?;
+    if removed == 0 {
+        return Ok(false);
+    }
+
+    let _: () = redis::cmd("HSET")
+        .arg(meta_key(message_id))
+        .arg("deliver_count")
+        .arg(0)
+        .query_async(conn)
+        .await?;
+
+    // LPUSH, not RPUSH: fetch pops from the tail, so the head is the back of
+    // the line. A replayed failure should not jump ahead of live webhooks.
+    let _: () = conn.lpush(queue_key(customer_id, endpoint), message_id).await?;
+    notify(conn, customer_id, endpoint, message_id).await;
+
+    tracing::info!(message_id = %message_id, "replayed from DLQ");
+    Ok(true)
+}
+
+/// Replay every message currently in the DLQ. Returns how many moved.
+///
+/// Drains from the tail so replayed messages keep their original arrival order
+/// on the main queue, and so a message that arrives in the DLQ mid-drain is not
+/// silently skipped.
+pub async fn dlq_replay_all(
+    conn: &mut redis::aio::MultiplexedConnection,
+    customer_id: &str,
+    endpoint: &str,
+) -> Result<u64, HeraldError> {
+    let dk = dead_key(customer_id, endpoint);
+    let qk = queue_key(customer_id, endpoint);
+    let mut moved: u64 = 0;
+
+    loop {
+        let msg_id: Option<String> = redis::cmd("RPOPLPUSH")
+            .arg(&dk)
+            .arg(&qk)
+            .query_async(conn)
+            .await?;
+
+        let Some(msg_id) = msg_id else { break };
+
+        let _: () = redis::cmd("HSET")
+            .arg(meta_key(&msg_id))
+            .arg("deliver_count")
+            .arg(0)
+            .query_async(conn)
+            .await?;
+
+        notify(conn, customer_id, endpoint, &msg_id).await;
+        moved += 1;
+    }
+
+    if moved > 0 {
+        tracing::info!(customer_id = %customer_id, endpoint = %endpoint, moved, "replayed DLQ");
+    }
+    Ok(moved)
+}
+
+/// Permanently delete one message from the DLQ, metadata included.
+///
+/// The fingerprint stays in the dedup set, so re-sending the identical payload
+/// is still deduplicated. Purging is about reclaiming storage, not about
+/// making a message ingestable again.
+pub async fn dlq_purge(
+    conn: &mut redis::aio::MultiplexedConnection,
+    customer_id: &str,
+    endpoint: &str,
+    message_id: &str,
+) -> Result<bool, HeraldError> {
+    let removed: u32 = conn.lrem(dead_key(customer_id, endpoint), 1, message_id).await?;
+    if removed == 0 {
+        return Ok(false);
+    }
+    let _: () = conn.del(meta_key(message_id)).await?;
+    tracing::info!(message_id = %message_id, "purged from DLQ");
+    Ok(true)
+}
+
+/// Permanently delete every message in the DLQ. Returns how many were removed.
+pub async fn dlq_purge_all(
+    conn: &mut redis::aio::MultiplexedConnection,
+    customer_id: &str,
+    endpoint: &str,
+) -> Result<u64, HeraldError> {
+    let dk = dead_key(customer_id, endpoint);
+    let ids: Vec<String> = conn.lrange(&dk, 0, -1).await?;
+
+    for msg_id in &ids {
+        let _: () = conn.del(meta_key(msg_id)).await?;
+    }
+    let _: () = conn.del(&dk).await?;
+
+    let purged = ids.len() as u64;
+    if purged > 0 {
+        tracing::warn!(customer_id = %customer_id, endpoint = %endpoint, purged, "purged DLQ");
+    }
+    Ok(purged)
+}
+
 /// Extend visibility timeout for a message (heartbeat).
 pub async fn heartbeat(
     conn: &mut redis::aio::MultiplexedConnection,

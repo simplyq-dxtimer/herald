@@ -111,6 +111,44 @@ enum Commands {
         json: bool,
     },
 
+    /// Inspect the dead letter queue. Read-only.
+    Dlq {
+        endpoint: String,
+        #[arg(long, default_value_t = 0)]
+        offset: i64,
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+        #[command(flatten)]
+        auth: AuthArgs,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Replay dead messages back onto the main queue
+    DlqReplay {
+        endpoint: String,
+        /// Message id to replay. Omit to replay the entire DLQ.
+        message_id: Option<String>,
+        #[command(flatten)]
+        auth: AuthArgs,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Permanently delete dead messages. Irreversible.
+    DlqPurge {
+        endpoint: String,
+        /// Message id to purge. Omit to purge the entire DLQ.
+        message_id: Option<String>,
+        /// Required when purging the whole DLQ.
+        #[arg(long)]
+        yes: bool,
+        #[command(flatten)]
+        auth: AuthArgs,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Show account and billing state, or set the tier
     Account {
         /// free | standard | pro | enterprise. Omit to read current state.
@@ -234,6 +272,43 @@ async fn main() {
         Commands::Heartbeat { endpoint, message_id, extend, auth, json } => {
             run_admin(auth, &config_path, json, |t| admin::heartbeat(t, endpoint, message_id, extend), |v| {
                 println!("{} visibility extended", v["message_id"].as_str().unwrap_or(""));
+            }).await;
+        }
+
+        Commands::Dlq { endpoint, offset, limit, auth, json } => {
+            run_admin(auth, &config_path, json, |t| admin::dlq_list(t, endpoint, offset, limit), |v| {
+                let empty = vec![];
+                let rows = v["data"].as_array().unwrap_or(&empty);
+                println!("{}: {} dead", v["endpoint"].as_str().unwrap_or(""), v["dlq_depth"]);
+                for r in rows {
+                    if r["expired"].as_bool().unwrap_or(false) {
+                        println!("  {}  <payload expired past retention>", r["message_id"].as_str().unwrap_or(""));
+                    } else {
+                        println!("  {}  deliver_count={}  {}",
+                            r["message_id"].as_str().unwrap_or(""),
+                            r["deliver_count"],
+                            r["body"].as_str().unwrap_or("<binary>"));
+                    }
+                }
+            }).await;
+        }
+
+        Commands::DlqReplay { endpoint, message_id, auth, json } => {
+            run_admin(auth, &config_path, json, |t| admin::dlq_replay(t, endpoint, message_id), |v| {
+                println!("replayed {} message(s)", v["replayed"]);
+            }).await;
+        }
+
+        Commands::DlqPurge { endpoint, message_id, yes, auth, json } => {
+            // Purging the whole DLQ destroys every payload that failed; make
+            // the caller say so rather than losing them to a typo'd argument.
+            if message_id.is_none() && !yes {
+                eprintln!("refusing to purge the entire DLQ for '{endpoint}' without --yes");
+                eprintln!("this permanently deletes every dead message and cannot be undone");
+                std::process::exit(1);
+            }
+            run_admin(auth, &config_path, json, |t| admin::dlq_purge(t, endpoint, message_id), |v| {
+                println!("purged {} message(s)", v["purged"]);
             }).await;
         }
 

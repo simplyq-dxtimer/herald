@@ -184,3 +184,61 @@ pub async fn account(t: Target, tier: Option<String>) -> Result<Value, CliError>
         None => client.billing().await,
     }
 }
+
+/// Read the dead letter queue. Read-only.
+///
+/// Bodies come back base64-encoded on the wire; decode them here as `poll`
+/// does, keeping `body_base64` authoritative for payloads that are not UTF-8.
+pub async fn dlq_list(
+    t: Target,
+    endpoint: String,
+    offset: i64,
+    limit: i64,
+) -> Result<Value, CliError> {
+    use base64::Engine as _;
+
+    let client = HeraldClient::new(&t.server, &t.api_key);
+    let mut resp = client.dlq_list(&endpoint, offset, limit).await?;
+
+    if let Some(rows) = resp.get_mut("data").and_then(|d| d.as_array_mut()) {
+        for row in rows.iter_mut() {
+            let decoded = row
+                .get("body")
+                .and_then(|b| b.as_str())
+                .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+                .and_then(|b| String::from_utf8(b).ok());
+            if let Some(b64) = row.get("body").cloned() {
+                row["body_base64"] = b64;
+            }
+            row["body"] = match decoded {
+                Some(text) => json!(text),
+                None => Value::Null,
+            };
+        }
+    }
+    resp["endpoint"] = json!(endpoint);
+    Ok(resp)
+}
+
+/// Move dead messages back onto the main queue. `message_id` None replays all.
+///
+/// deliver_count is reset server-side, otherwise a replayed message is already
+/// at max_retries and dies again on its first failure.
+pub async fn dlq_replay(
+    t: Target,
+    endpoint: String,
+    message_id: Option<String>,
+) -> Result<Value, CliError> {
+    let client = HeraldClient::new(&t.server, &t.api_key);
+    client.dlq_replay(&endpoint, message_id.as_deref()).await
+}
+
+/// Permanently delete dead messages. `message_id` None purges the whole DLQ.
+pub async fn dlq_purge(
+    t: Target,
+    endpoint: String,
+    message_id: Option<String>,
+) -> Result<Value, CliError> {
+    let client = HeraldClient::new(&t.server, &t.api_key);
+    client.dlq_purge(&endpoint, message_id.as_deref()).await
+}

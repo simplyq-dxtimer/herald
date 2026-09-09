@@ -161,6 +161,71 @@ impl HeraldClient {
         Ok(())
     }
 
+    /// Read the dead letter queue. Read-only: listing never replays, purges,
+    /// or alters delivery counts.
+    pub async fn dlq_list(
+        &self,
+        endpoint: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<serde_json::Value, CliError> {
+        let url = format!(
+            "{}/endpoints/{}/dlq?offset={}&limit={}",
+            self.base_url, endpoint, offset, limit
+        );
+        self.get_json(&url, "dlq list").await
+    }
+
+    /// Replay one message, or every message when `message_id` is None.
+    pub async fn dlq_replay(
+        &self,
+        endpoint: &str,
+        message_id: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let url = match message_id {
+            Some(id) => format!("{}/endpoints/{}/dlq/{}/replay", self.base_url, endpoint, id),
+            None => format!("{}/endpoints/{}/dlq/replay", self.base_url, endpoint),
+        };
+        self.send_json(self.http.post(&url), "dlq replay").await
+    }
+
+    /// Permanently delete one message, or the whole DLQ when `message_id` is
+    /// None. Irreversible.
+    pub async fn dlq_purge(
+        &self,
+        endpoint: &str,
+        message_id: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let url = match message_id {
+            Some(id) => format!("{}/endpoints/{}/dlq/{}", self.base_url, endpoint, id),
+            None => format!("{}/endpoints/{}/dlq", self.base_url, endpoint),
+        };
+        self.send_json(self.http.delete(&url), "dlq purge").await
+    }
+
+    async fn get_json(&self, url: &str, what: &str) -> Result<serde_json::Value, CliError> {
+        self.send_json(self.http.get(url), what).await
+    }
+
+    async fn send_json(
+        &self,
+        req: reqwest::RequestBuilder,
+        what: &str,
+    ) -> Result<serde_json::Value, CliError> {
+        let resp = req
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .send()
+            .await
+            .map_err(|e| CliError::Http(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(CliError::Http(format!("{what} failed ({status}): {body}")));
+        }
+        resp.json().await.map_err(|e| CliError::Http(e.to_string()))
+    }
+
     /// Current account and billing state.
     pub async fn billing(&self) -> Result<serde_json::Value, CliError> {
         let url = format!("{}/account/billing", self.base_url);
