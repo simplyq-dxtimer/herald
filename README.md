@@ -69,6 +69,28 @@ HERALD_ENCRYPTION_KEY=$(openssl rand -hex 32) \
 ./target/release/herald-server
 ```
 
+### Split listeners
+
+By default every route is served on `HERALD_LISTEN_ADDR`. Set
+`HERALD_ADMIN_LISTEN_ADDR` to split the surface across two addresses:
+
+| Listener | Routes | Exposure |
+| --- | --- | --- |
+| `HERALD_LISTEN_ADDR` | `POST /<customer>/<endpoint>`, `/stripe/webhook`, `/health` | public — providers must reach it |
+| `HERALD_ADMIN_LISTEN_ADDR` | `/register`, `/account/*`, `/endpoints/*` (poll, ack, nack, stream), `/health` | private — bind to loopback, a VPN address, or a private subnet |
+
+Anything not served on a listener returns 404 there, so a leaked API key alone
+does not let queued payloads be read from the internet.
+
+```bash
+HERALD_LISTEN_ADDR=0.0.0.0:8080 \
+HERALD_ADMIN_LISTEN_ADDR=100.90.105.9:8081 \
+HERALD_REGISTER_SECRET=$(openssl rand -hex 32) \
+./target/release/herald-server
+```
+
+Leave `HERALD_ADMIN_LISTEN_ADDR` unset to keep the single-listener behavior.
+
 ## herald-cli
 
 Optional local daemon that polls Herald and invokes your agent.

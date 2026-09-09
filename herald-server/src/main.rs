@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use axum::routing::{get, post};
 use axum::Router;
+use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
@@ -31,6 +32,7 @@ async fn main() {
 
     tracing::info!(
         listen_addr = %config.listen_addr,
+        admin_listen_addr = ?config.admin_listen_addr,
         redis_url = %config.redis_url,
         "starting herald-server"
     );
@@ -61,19 +63,66 @@ async fn main() {
         }
     });
 
-    // Build the router
-    let app = Router::new()
-        // Account registration (no auth — returns API key)
-        .route("/register", post(routes::register::register))
-        // Billing and tier management
-        .route("/account/billing", get(billing::get_billing))
-        .route("/account/tier", post(billing::set_tier))
-        .route("/stripe/webhook", post(billing::stripe_webhook))
+    let listener = TcpListener::bind(&config.listen_addr)
+        .await
+        .expect("failed to bind");
+
+    match config.admin_listen_addr.as_deref() {
+        // Split mode: the ingest surface is exposed on `listen_addr` (safe to
+        // publish to the internet), while registration, billing and the agent
+        // API are only reachable on `admin_listen_addr` — bind that to a
+        // private interface (loopback, a VPN address, a private subnet).
+        Some(admin_addr) => {
+            let admin_listener = TcpListener::bind(admin_addr)
+                .await
+                .expect("failed to bind admin listener");
+
+            let public_app = finalize(ingest_routes(), state.clone());
+            let admin_app = finalize(management_routes(), state);
+
+            tracing::info!(addr = %config.listen_addr, "herald-server ingest listener");
+            tracing::info!(addr = %admin_addr, "herald-server admin listener");
+
+            tokio::select! {
+                r = axum::serve(listener, public_app) => r.expect("ingest server error"),
+                r = axum::serve(admin_listener, admin_app) => r.expect("admin server error"),
+            }
+        }
+        // Single-listener mode (default): every route on one address.
+        None => {
+            let app = finalize(ingest_routes().merge(management_routes()), state);
+
+            tracing::info!(addr = %config.listen_addr, "herald-server listening");
+
+            axum::serve(listener, app).await.expect("server error");
+        }
+    }
+}
+
+/// Routes that inbound providers call. No authentication by design — anyone
+/// holding the endpoint URL may POST to it, so this surface is safe to expose
+/// publicly.
+fn ingest_routes() -> Router<AppState> {
+    Router::new()
         // Inbound webhook ingestion (no auth — providers POST freely)
         .route(
             "/{customer_id}/{endpoint_name}",
             post(routes::ingest::ingest_webhook),
         )
+        // Stripe delivers signed callbacks from the public internet
+        .route("/stripe/webhook", post(billing::stripe_webhook))
+}
+
+/// Routes that mint or consume credentials, or that read queued payloads back
+/// out. API-key authenticated, but keep them off the public listener when a
+/// private interface is available.
+fn management_routes() -> Router<AppState> {
+    Router::new()
+        // Account registration (no auth — returns API key)
+        .route("/register", post(routes::register::register))
+        // Billing and tier management
+        .route("/account/billing", get(billing::get_billing))
+        .route("/account/tier", post(billing::set_tier))
         // Agent polling and management (auth required) — resource-oriented paths
         .route(
             "/endpoints/{endpoint_name}/messages",
@@ -100,20 +149,15 @@ async fn main() {
             "/endpoints/{endpoint_name}/stream",
             get(routes::websocket::websocket_handler),
         )
-        // Health check (landing page + docs moved to jmcentire/herald-tools,
-        // served from herald.tools/ — this app now serves only the API at
-        // proxy.herald.tools/...)
+}
+
+/// Attach `/health` and shared middleware. Health lives here rather than in
+/// either group so both listeners answer probes in split mode.
+fn finalize(router: Router<AppState>, state: AppState) -> Router {
+    router
         .route("/health", get(health_check))
         .layer(TraceLayer::new_for_http())
-        .with_state(state);
-
-    let listener = tokio::net::TcpListener::bind(&config.listen_addr)
-        .await
-        .expect("failed to bind");
-
-    tracing::info!(addr = %config.listen_addr, "herald-server listening");
-
-    axum::serve(listener, app).await.expect("server error");
+        .with_state(state)
 }
 
 async fn health_check() -> &'static str {

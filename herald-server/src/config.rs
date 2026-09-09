@@ -4,6 +4,12 @@ use std::time::Duration;
 pub struct Config {
     pub redis_url: String,
     pub listen_addr: String,
+    /// If set, `listen_addr` serves only the ingest surface (provider webhooks
+    /// plus `/health`) and registration, billing and the agent API move to this
+    /// address instead. Bind it to a private interface so queued payloads are
+    /// not readable from the public internet.
+    /// Unset = every route on `listen_addr` (single-listener behavior).
+    pub admin_listen_addr: Option<String>,
     pub service_encryption_key: [u8; 32],
     /// If set, POST /register requires this as a Bearer token.
     /// Unset = open registration (hosted service behavior).
@@ -91,6 +97,10 @@ impl Config {
         let listen_addr =
             std::env::var("HERALD_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
 
+        let admin_listen_addr = std::env::var("HERALD_ADMIN_LISTEN_ADDR")
+            .ok()
+            .filter(|s| !s.is_empty());
+
         let key_hex = std::env::var("HERALD_ENCRYPTION_KEY").unwrap_or_else(|_| {
             if std::env::var("HERALD_DEV_MODE").is_ok() {
                 tracing::warn!("HERALD_ENCRYPTION_KEY not set, generating ephemeral key (dev mode)");
@@ -125,6 +135,7 @@ impl Config {
         Config {
             redis_url,
             listen_addr,
+            admin_listen_addr,
             service_encryption_key,
             register_secret,
             stripe_api_key,
